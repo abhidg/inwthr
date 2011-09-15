@@ -1,0 +1,16 @@
+# Indian weather data command-line tool
+
+This small program was directly inspired by
+http://fungi.yuggoth.org/weather/ which shows a nice summary of the
+weather from METAR data.
+
+However METAR data is collected only at airports; while I found that IMD
+Kolkata has a wonderful page [1] using Google maps which shows the weather
+data from the numerous installed automatic weather stations. Plus, the cool
+bit is that they have an export function which dumps all that data into CSV
+file for easy parsing.
+
+So I put together this script to parse the file (which stores the weather
+data in the SYNOP format) and give the weather information on the terminal.
+
+[1]: http://www.imdkolkata.gov.in/maps/rmckol/plotaws.php

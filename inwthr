@@ -1,0 +1,276 @@
+#!/usr/bin/python
+# copyright 2011 Abhishek Dasgupta <abhidg@gmail.com>
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.  This file is offered as-is,
+# without any warranty.
+
+import os
+import sys
+import csv
+import time
+import urllib
+
+def trim_spaces(string):
+    "remove extra spaces"
+    return " ".join(string.strip().split())
+
+def temp(s):
+    "temperature from synop"
+    if s[1:] == '////': return 'unknown'
+    sign = int(s[1])
+    assert sign == 0 or sign == 1
+    t = int(s[2:])/10.0
+    return (t if sign == 0 else -t)
+
+def pressure(s):
+    "pressure from synop"
+
+    if s[1:] == '////': return 'unknown'
+    p = int(s[1:])/10.0
+    if p < 200: # arbitrary value, really
+        p = p + 1000.0
+    return p
+
+def precip(s):
+    "precipitation from synop"
+
+    assert s.startswith('6')
+    p = int(s[1:-1])
+    if p < 990: return p
+    if p > 999: return (p - 990)/10.0
+    if p == 990: return 'trace'
+
+def read_synop(synop_data, parse_fields, synop):
+    """
+    Read the raw data as represented in synop, in the
+    manner determined by parse_fields, into synop_data
+    """
+
+    for s in zip(parse_fields, synop):
+        syn = s[1]
+        field, test, process = s[0]
+        if test(syn):
+            synop_data[field] = process(syn)
+
+def contract(g):
+    "g is a tuple (f, x), this function returns f(x)"
+    f, x = g
+    return f(x)
+
+def parse_synop(synop):
+    synop_data = {}
+    "Parses SYNOP code and returns a dict"
+
+    assert synop[-1] == '='
+
+    notest = lambda x: True
+    identity = lambda x: x
+    positive = identity
+    negative = lambda x: -x
+    
+    synop = synop.split()
+
+    parse_fields = (
+             ('station-type', lambda x: len(x) == 4, identity)
+           , ('station-code', lambda x: len(x) == 3, identity)
+           , ('time-wind-type', notest, identity)
+           , ('latitude', lambda x: x.startswith('99'),
+               lambda x: int(x[2:])/10.0)
+           , ('longitude', notest, identity)
+           , ('unknown', notest, identity)
+           , ('elevation', lambda x: x.endswith('2'), lambda x: int(x)/10)
+           , ('26blob', lambda x: x == '26///', identity)
+           , ('cloud-wind', notest, identity)
+           , ('temperature', lambda x: x.startswith('1'), temp)
+           , ('dewpoint', lambda x: x.startswith('2'), temp)
+           , ('station-pressure', lambda x: x.startswith('3'), pressure)
+           , ('sea-level-pressure', lambda x: x.startswith('4'), pressure)
+           , ('5block', notest, identity)
+           , ('6block', notest, identity)
+           , ('7block', notest, identity)
+           , ('8block', notest, identity)
+           , ('9block', notest, identity)
+           , ('333', notest, identity)
+    )
+
+    mintemp_field = (
+            ('minimum-temperature', lambda x: x.startswith('2'), temp),
+            )
+    parse_post_block_fields = (
+             ('5n5block', notest, identity)
+           , ('unknown', notest, identity)
+           , ('pressure-tendency', lambda x: x.startswith('5'), lambda x:
+               int(x[2:])/10.0)
+           , ('precipitation', lambda x: x.startswith('6'), precip)
+        )
+
+    synop_data = {}
+    read_synop(synop_data, parse_fields, synop)
+    synop3block = synop[synop.index('333') + 1:]
+
+    if synop3block[0].startswith('2'):
+        # minimum temperature field present
+        parse_post_block_fields = mintemp_field + parse_post_block_fields
+    
+    # now read the part of the SYNOP which is after 333
+    read_synop(synop_data, parse_post_block_fields, synop3block)
+
+    # correct latitude and longitude
+    lat_long_signs = {
+            1: (positive, positive)
+          , 3: (negative, positive)
+          , 5: (negative, negative)
+          , 7: (positive, negative)
+          }
+    quarter = int(synop_data['longitude'][0])
+    synop_data['longitude'] = int(synop_data['longitude'][1:])/10.0
+    synop_data['latitude'], synop_data['longitude'] = \
+        map(contract, zip(lat_long_signs[quarter], (synop_data['latitude'],
+            synop_data['longitude'])))
+    return synop_data
+
+def wind_str(w):
+    """Generates a string from parsed SYNOP data to represent wind
+    conditions."""
+    t = int(w['time-wind-type'][-1])
+    if w['cloud-wind'][1:] == '////': return "unknown"
+    meas_strings = ('m/s (est.)', 'm/s (anem.)', 'kt (est.)', 'kt (anem.)',
+            'KT')
+    direction_degrees = 10 * int(w['cloud-wind'][1:3])
+    speed = int(w['cloud-wind'][3:])
+    direction = wind_direction(direction_degrees)
+    if t < 2:
+        mph_speed = speed * 2.23693629 # from m/s
+    else:
+        mph_speed = speed * 1.15077945 # from knots:w
+
+    return "from the %s (%d degrees) at %d MPH (%d %s)" % (
+            direction, direction_degrees, mph_speed, speed,
+            meas_strings[t])
+
+def precip_str(w):
+    if 'precipitation' not in w.keys():
+        return 'not available'
+    if type(w['precipitation']) == str:
+        return w['precipitation']
+    else:
+        return str(w['precipitation']) + " mm"
+
+def to_deg_minutes(l):
+    "Converts latitude and longitude to degrees and minutes"
+    return int(l), int(60*(l - int(l)))
+
+def wind_direction(deg):
+    "Gives cardinal direction from degrees (assumed integers)"
+    if deg < 11: return "N"
+    directions = "NNE NE ENE E ESE SE SSE S SSW" \
+            + " SW WSW W WNW NW NNW N"
+    directions = reversed(directions.split())
+    angles = map(lambda i: 11.25 + i*22.5, range(16))
+    angles.reverse()
+    for angle, direction in zip(angles, directions):
+        if deg > angle: return direction
+
+def lat_str(l):
+    latd, latmin = to_deg_minutes(l)
+    ns = latd > 0 and "N" or "S"
+    return "%d-%d%s" % (latd, latmin, ns)
+
+def long_str(l):
+    longd, longmin = to_deg_minutes(l)
+    ew = longd > 0 and "E" or "W"
+    return "%d-%d%s" % (longd, longmin, ew)
+
+def rel_hum(w):
+    if type(w['dewpoint']) != str:
+        return "%d%%" % (100 - 5*(w['temperature'] - w['dewpoint']))
+    else:
+        return "unknown"
+
+def pressure_str(w):
+    if type(w['station-pressure']) == float:
+        return "%.1f" % w['station-pressure']
+    else:
+        return "unknown"
+
+def pp(station, synop_data):
+    """Pretty prints weather data in the form followed by
+    the weather utility at http://fungi.yuggoth.org/weather/"""
+
+    w = synop_data
+    if type(w) != type(dict()):
+        w = parse_synop(w)
+    return \
+"""Current conditions at %s (%s) %s %s %dM
+   Temperature: %d C (%d F)
+   Relative Humidity: %s
+   Wind: %s
+   Station Pressure: %s hPa
+   Rainfall: %s""" % (station,
+        w['station-code'],
+        lat_str(w['latitude']),
+        long_str(w['longitude']),
+        w['elevation'],
+        w['temperature'],
+        w['temperature'] * 9/5.0 + 32,
+        rel_hum(w),
+        wind_str(w),
+        pressure_str(w),
+        precip_str(w),
+        )
+
+def feed_data(row, data):
+    "Feeds data from a row in the CSV file to the data hash."
+    if len(row) != 4:
+        return
+    row = map(str.strip, row)
+    callcode = row[2]
+    data[callcode] = {
+            'station': row[0],
+            'state': row[1],
+            'synop': row[3]
+            }
+
+if __name__ == "__main__":
+    if len(sys.argv) == 1:
+        print """usage: inwthr station-code1 station-code2 ...
+The program accepts codes in lower or mixed-case as well.
+
+A list of codes can be obtained at the IMD site
+ http://www.imdkolkata.gov.in/maps/rmckol/plotaws.php
+(the station code is the three-letter code displayed in bold
+in brackets once a place marker is clicked. An alternative is
+to download the CSV file using the link given below the map)"""
+        sys.exit(1)
+    weatherdata = {}
+    now = time.gmtime()
+    date = "%d-%02d-%02d" % (now.tm_year, now.tm_mon, now.tm_mday)
+    hour = now.tm_hour
+    while True:
+        params = urllib.urlencode({'obs_date': '%s %d:00' % (date, hour)})
+        f = urllib.urlopen("http://www.imdkolkata.gov.in/maps/rmckol/export.php",
+                params)
+        lines = f.readlines()
+        if len(lines) == 1:
+            hour = hour - 1
+            continue
+        else:
+            break
+    if hour != now.tm_hour:
+        print "Weather as of %d:30 IST" % (hour + 5)
+    reader = csv.reader(lines, quoting=csv.QUOTE_ALL)
+    header = True
+    for row in reader:
+        if header:
+            header = False
+            continue
+        feed_data(row, weatherdata)
+    for stncode in sys.argv[1:]:
+        if stncode.upper() not in weatherdata.keys():
+            print "> Station", stncode.upper(), "not found in weather data."
+        else:
+            stationdata = weatherdata[stncode.upper()]
+            station = stationdata['station']
+            synop = stationdata['synop']
+            print pp(station, synop)
